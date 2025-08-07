@@ -1,16 +1,33 @@
-# This is a sample Python script.
+import os
+from datetime import date, timedelta
+from supabase import create_client
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+# 🔐 Načíta tajné premenné z GitHub Secrets
+url = os.environ.get("SUPABASE_URL")
+key = os.environ.get("SUPABASE_API_KEY")
 
+# 🔗 Pripojenie na Supabase
+supabase = create_client(url, key)
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+# 📅 Vygeneruj dnešný a notifikačné dátumy
+today = date.today()
+first_notification = today + timedelta(days=30)
+second_notification = today + timedelta(days=60)
 
+# 📄 Údaje pre vloženie
+data = {
+    "znacka": "98765/TEST",
+    "nazovstavby": "Testovacia stavba",
+    "created_at": today.isoformat(),
+    "firstnotification": first_notification.isoformat(),
+    "secondnotification": second_notification.isoformat(),
+    "test": True,
+    "done": False,
+    "notifications_enabled": True
+}
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+# 📨 INSERT do databázy
+response = supabase.table("notifications").insert(data).execute()
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+print("✅ Záznam vložený:")
+print(response.data)
