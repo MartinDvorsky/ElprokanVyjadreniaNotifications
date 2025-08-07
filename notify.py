@@ -45,10 +45,10 @@ class NotificationService:
         self.supabase: Client = create_client(url, key)
         self.emailSender = EmailSender()
         # Ping na heartbeat tabuľku
-        #self.supabase.table("heartbeat").insert({
-        #    "executed_at": today.isoformat(),
-        #    "note": "Daily GitHub Actions ping"
-        #}).execute()
+        self.supabase.table("heartbeat").insert({
+            "executed_at": today.isoformat(),
+            "note": "Daily GitHub Actions ping"
+        }).execute()
 
     def select_unfinished(self):
         response = self.supabase.table("notification").select("*").eq("done", False).execute()
