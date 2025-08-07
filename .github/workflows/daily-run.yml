@@ -2,7 +2,7 @@ name: Run daily script
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # 8:00 SK/CEST čas
+    - cron: '0 5 * * *'  # 7:00 SK/CEST čas
   workflow_dispatch:      # manuálne spustenie
 
 jobs:
@@ -25,4 +25,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          EMAIL: ${{ secrets.EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python notify.py
