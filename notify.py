@@ -6,6 +6,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 #load_dotenv()
 
 url = os.environ["SUPABASE_URL"]
@@ -14,7 +15,7 @@ email =os.environ["EMAIL"]
 email_pass  = os.environ["EMAIL_PASSWORD"]
 
 today = date.today()
-now = datetime.now(timezone.utc).isoformat()
+now_local = datetime.now(ZoneInfo("Europe/Bratislava"))
 
 class EmailSender:
     def __init__(self):
@@ -46,7 +47,7 @@ class NotificationService:
         self.emailSender = EmailSender()
         # Ping na heartbeat tabuľku
         self.supabase.table("heartbeat").insert({
-            "executed_at": now,
+            "executed_at": now_local,
             "note": "Daily GitHub Actions ping"
         }).execute()
 
