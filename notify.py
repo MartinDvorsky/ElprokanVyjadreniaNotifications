@@ -6,16 +6,17 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
+from typing import Optional
 
 #load_dotenv()
 
 url = os.environ["SUPABASE_URL"]
 key = os.environ["SUPABASE_API_KEY"]
-email =os.environ["EMAIL"]
-email_pass  = os.environ["EMAIL_PASSWORD"]
+email = os.environ["EMAIL"]
+email_pass = os.environ["EMAIL_PASSWORD"]
 
 today = date.today()
-now_iso = datetime.now(timezone.utc).isoformat()  # alebo .replace(microsecond=0).isoformat()
+now_iso = datetime.now(timezone.utc).isoformat()
 
 class EmailSender:
     def __init__(self):
@@ -23,17 +24,26 @@ class EmailSender:
         self.outlook_password = email_pass
         self.smtp_server = "smtp.office365.com"
         self.smtp_port = 587
+        self.error_message = ""
 
     def sendEmail(self, subject, body):
-        message = MIMEMultipart()
-        message["From"] = self.outlook_email
-        message["To"] = self.outlook_email
-        message["Subject"] = subject
-        message.attach(MIMEText(body, "html"))
-        server = smtplib.SMTP(self.smtp_server, self.smtp_port)
-        server.starttls()
-        server.login(self.outlook_email, self.outlook_password)
-        server.send_message(message)
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = self.outlook_email
+            msg["To"] = self.outlook_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "html"))
+
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.outlook_email, self.outlook_password)
+                server.send_message(msg)
+            return True
+        except Exception as e:
+            print(f"[MAIL ERROR] {e}")
+            self.error_message = f"[SMTP MAIL ERROR] {e}"
+            return False
+
 
 class NotificationService:
     def __init__(self):
@@ -44,6 +54,21 @@ class NotificationService:
             "executed_at": now_iso,
             "note": "Daily GitHub Actions ping"
         }).execute()
+
+        self.errorMessage = None
+
+    def logAction(self, notification_id: int, action_type: str,
+                  # 'firstNotification' | 'secondNotification' | 'setDone'
+                  status: str = "SUCCESS",  # 'SUCCESS' | 'ERROR'
+                  error_message: Optional[str] = None,
+                  ):
+        payload = {
+            "idnotification": notification_id,
+            "action_type": action_type,
+            "status": status,
+            "error_message": error_message,
+        }
+        self.supabase.table("notification_logs").insert(payload).execute()
 
     def buildNotifiactionBody(self, znacka: str, nazov_stavby: str, link: str | None, days: int = 30) -> str:
         safe_title = f"{znacka} – {nazov_stavby}"
@@ -99,45 +124,62 @@ class NotificationService:
         </html>
         """
 
-    def select_unfinished(self):
+    def selectUnfinished(self):
         response = self.supabase.table("notification").select("*").eq("done", False).execute()
         return response.data
 
-    def set_done(self, id):
-        response = self.supabase.table("notification").update({"done": True}).eq("idnotification", id).execute()
-        return bool(response.data)
+    def setDone(self, id):
+        try:
+            response = self.supabase.table("notification").update({"done": True}).eq("idnotification", id).execute()
+            return bool(response.data)
+        except Exception as e:
+            self.errorMessage = f"[setDone ERROR] {e}"
+            return False
 
-    def check_and_notify(self):
-        unfinished = self.select_unfinished()
+    def checkAndNotify(self):
+        unfinished = self.selectUnfinished()
         for item in unfinished:
             id_ = item["idnotification"]
             test = item.get("test", False)
+            #test interface
             """if test:
                 self.emailSender.sendEmail(
                     f"{item['znacka']} - {item['nazovstavby']}",
                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=30))
                 continue"""
 
-            # dátumy z databázy (ako string) prevedieme na objekt typu date
             first_date = date.fromisoformat(item["firstnotification"])
             second_date = date.fromisoformat(item["secondnotification"])
 
-
             if today == first_date:
-                self.emailSender.sendEmail(
+                firstNotificationCheck = self.emailSender.sendEmail(
                     f"{item['znacka']} - {item['nazovstavby']}",
                     self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=30)
                 )
 
+                if firstNotificationCheck:
+                    self.logAction(id_, "firstNotification")
+                else:
+                    self.logAction(id_, "firstNotification", "ERROR", self.emailSender.error_message)
+
             elif today == second_date:
-                self.emailSender.sendEmail(
+                secondNotification = self.emailSender.sendEmail(
                     f"{item['znacka']} - {item['nazovstavby']}",
                     self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=60)
                 )
 
-                print(f"[{id_}] - Označujeme ako hotové (done=True).")
-                self.set_done(id_)
+                if secondNotification:
+                    self.logAction(id_, "secondNotification")
+                    setDone = self.setDone(id_)
+                    if setDone:
+                        self.logAction(id_, "setDone")
+                    else:
+                        self.logAction(id_, "setDone", "ERROR", self.errorMessage)
+                else:
+                    self.logAction(id_, "secondNotification", "ERROR", self.emailSender.error_message)
+
+
 
 
 n = NotificationService()
-n.check_and_notify()
+n.checkAndNotify()
