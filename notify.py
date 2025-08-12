@@ -30,7 +30,7 @@ class EmailSender:
         try:
             msg = MIMEMultipart()
             msg["From"] = self.outlook_email
-            msg["To"] = self.outlook_email
+            msg["To"] = "elprokan@elprokan.sk"
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "html"))
 
@@ -70,7 +70,7 @@ class NotificationService:
         }
         self.supabase.table("notification_logs").insert(payload).execute()
 
-    def buildNotifiactionBody(self, znacka: str, nazov_stavby: str, link: str | None, days: int = 30) -> str:
+    def buildNotifiactionBody(self, znacka: str, nazov_stavby: str, link: str | None, days: int = 20) -> str:
         safe_title = f"{znacka} – {nazov_stavby}"
 
         # časť s tlačidlom + linkom
@@ -154,7 +154,7 @@ class NotificationService:
             if today == first_date:
                 firstNotificationCheck = self.emailSender.sendEmail(
                     f"{item['znacka']} - {item['nazovstavby']}",
-                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=30)
+                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=20)
                 )
 
                 if firstNotificationCheck:
@@ -165,7 +165,7 @@ class NotificationService:
             elif today == second_date:
                 secondNotification = self.emailSender.sendEmail(
                     f"{item['znacka']} - {item['nazovstavby']}",
-                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=60)
+                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=40)
                 )
 
                 if secondNotification:
