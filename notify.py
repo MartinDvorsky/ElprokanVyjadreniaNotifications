@@ -30,8 +30,8 @@ class EmailSender:
         try:
             msg = MIMEMultipart()
             msg["From"] = self.outlook_email
-            #msg["To"] = "elprokan@elprokan.sk"
-            msg["To"] = self.outlook_email
+            msg["To"] = "elprokan@elprokan.sk"
+            #msg["To"] = self.outlook_email
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "html"))
 
