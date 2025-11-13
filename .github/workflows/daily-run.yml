@@ -23,8 +23,13 @@ jobs:
 
       - name: Run script
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
-          EMAIL: ${{ secrets.EMAIL }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+            TENANT_ID: ${{ secrets.TENANT_ID }}
+            CLIENT_ID: ${{ secrets.CLIENT_ID }}
+            CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+            SHAREPOINT_SITE_URL: ${{ secrets.SHAREPOINT_SITE_URL }}
+            OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+            EMAIL: ${{ secrets.EMAIL }}
+            EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python notify.py
