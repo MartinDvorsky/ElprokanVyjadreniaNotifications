@@ -1,6 +1,5 @@
-from datetime import date
+from datetime import date, timedelta
 from supabase import create_client, Client
-#from dotenv import load_dotenv
 import os
 import smtplib
 from email.mime.text import MIMEText
@@ -8,6 +7,11 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 from typing import Optional
 
+# Import SharePoint managera z existujúceho súboru
+from SharepointKartaStavbyFinder import SharePointManager
+
+
+#from dotenv import load_dotenv
 #load_dotenv()
 
 url = os.environ["SUPABASE_URL"]
@@ -15,8 +19,16 @@ key = os.environ["SUPABASE_API_KEY"]
 email = os.environ["EMAIL"]
 email_pass = os.environ["EMAIL_PASSWORD"]
 
+# SharePoint credentials
+TENANT_ID = os.environ['TENANT_ID']
+CLIENT_ID = os.environ['CLIENT_ID']
+CLIENT_SECRET = os.environ['CLIENT_SECRET']
+SHAREPOINT_SITE_URL = os.environ['SHAREPOINT_SITE_URL']
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+
 today = date.today()
 now_iso = datetime.now(timezone.utc).isoformat()
+
 
 class EmailSender:
     def __init__(self):
@@ -26,12 +38,11 @@ class EmailSender:
         self.smtp_port = 587
         self.error_message = ""
 
-    def sendEmail(self, subject, body):
+    def sendEmail(self, subject, body, to_email="elprokan@elprokan.sk"):
         try:
             msg = MIMEMultipart()
             msg["From"] = self.outlook_email
-            msg["To"] = "elprokan@elprokan.sk"
-            #msg["To"] = self.outlook_email
+            msg["To"] = to_email
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "html"))
 
@@ -50,6 +61,15 @@ class NotificationService:
     def __init__(self):
         self.supabase: Client = create_client(url, key)
         self.emailSender = EmailSender()
+
+        # Inicializácia SharePoint managera
+        self.sharepoint = SharePointManager(TENANT_ID, CLIENT_ID, CLIENT_SECRET, OPENAI_API_KEY)
+        if self.sharepoint.get_access_token():
+            self.sharepoint.get_site_id(SHAREPOINT_SITE_URL)
+            print("[SharePoint] ✓ Úspešne pripojený")
+        else:
+            print("[SharePoint] ✗ Zlyhalo pripojenie")
+
         # Ping na heartbeat tabuľku
         self.supabase.table("heartbeat").insert({
             "executed_at": now_iso,
@@ -59,10 +79,8 @@ class NotificationService:
         self.errorMessage = None
 
     def logAction(self, notification_id: int, action_type: str,
-                  # 'firstNotification' | 'secondNotification' | 'setDone'
-                  status: str = "SUCCESS",  # 'SUCCESS' | 'ERROR'
-                  error_message: Optional[str] = None,
-                  ):
+                  status: str = "SUCCESS",
+                  error_message: Optional[str] = None):
         payload = {
             "idnotification": notification_id,
             "action_type": action_type,
@@ -71,10 +89,107 @@ class NotificationService:
         }
         self.supabase.table("notification_logs").insert(payload).execute()
 
+    def getSharePointLink(self, znacka: str, nazov_stavby: str) -> Optional[str]:
+        """
+        Nájde Kartu stavby na SharePointe a vráti webUrl
+
+        Returns:
+            str: SharePoint webUrl alebo None ak sa nenašiel
+        """
+        try:
+            print(f"[SharePoint] Hľadám súbor pre {znacka}...")
+
+            # Použije existujúcu metódu na vyhľadanie xlsx súborov
+            files = self.sharepoint.get_xlsx_files_from_folder(
+                znacka,
+                nazov_stavby,
+                search_subfolders=False,
+                auto_select=True
+            )
+
+            if files and len(files) > 0:
+                selected_file = files[0]
+                web_url = selected_file.get('webUrl')
+
+                if web_url:
+                    print(f"[SharePoint] ✓ Nájdený: {selected_file['name']}")
+                    return web_url
+                else:
+                    print(f"[SharePoint] ✗ webUrl nebola nájdená v odpovedi")
+                    return None
+            else:
+                print(f"[SharePoint] ✗ Súbor nenájdený")
+                return None
+
+        except Exception as e:
+            print(f"[SharePoint] ✗ Chyba pri hľadaní: {e}")
+            return None
+
+    def buildTestEmailBody(self, znacka: str, nazov_stavby: str, link: str | None,
+                           days: int, error: str | None = None) -> str:
+        """Email pre testovanie deň pred odoslaním"""
+        safe_title = f"🧪 TEST: {znacka} – {nazov_stavby}"
+
+        if error:
+            status_html = f"""
+            <div style="background:#fee2e2; border-left:4px solid #dc2626; padding:16px; border-radius:8px; margin:16px 0;">
+                <p style="margin:0; color:#991b1b; font-weight:600;">❌ CHYBA PRI HĽADANÍ NA SHAREPOINTE</p>
+                <p style="margin:8px 0 0; color:#7f1d1d; font-size:13px;">{error}</p>
+            </div>
+            """
+        elif link:
+            status_html = f"""
+            <div style="background:#dcfce7; border-left:4px solid #16a34a; padding:16px; border-radius:8px; margin:16px 0;">
+                <p style="margin:0; color:#166534; font-weight:600;">✅ DOKUMENT ÚSPEŠNE NÁJDENÝ</p>
+                <p style="margin:8px 0 0; color:#14532d; font-size:13px; word-break:break-all;">Link: {link}</p>
+            </div>
+            """
+        else:
+            status_html = """
+            <div style="background:#fef3c7; border-left:4px solid #f59e0b; padding:16px; border-radius:8px; margin:16px 0;">
+                <p style="margin:0; color:#92400e; font-weight:600;">⚠️ DOKUMENT NENÁJDENÝ</p>
+                <p style="margin:8px 0 0; color:#78350f; font-size:13px;">Skontroluj SharePoint pred odoslaním notifikácie.</p>
+            </div>
+            """
+
+        return f"""
+        <!DOCTYPE html>
+        <html lang="sk">
+        <head>
+        <meta charset="UTF-8">
+        </head>
+        <body style="margin:0; padding:0; background:#ffffff; font-family:Segoe UI, Roboto, Arial, sans-serif;">
+          <div style="padding:24px;">
+            <div style="max-width:640px; margin:0 auto; background:#ffffff; border-radius:12px;
+                        box-shadow:0 2px 8px rgba(0,0,0,.06); padding:24px; color:#1f2937;">
+              <h1 style="font-size:20px; font-weight:700; margin:0 0 8px;">{safe_title}</h1>
+              <p style="color:#6b7280; margin:0 0 16px; font-size:14px;">
+                Testovací email - notifikácia bude odoslaná zajtra ({days} dní)
+              </p>
+
+              {status_html}
+
+              <div style="background:#f9fafb; border-radius:8px; padding:16px; margin:16px 0;">
+                <p style="margin:0 0 8px; font-weight:600; font-size:14px;">📋 Informácie:</p>
+                <p style="margin:4px 0; font-size:13px; color:#4b5563;">
+                  <strong>Značka:</strong> {znacka}<br>
+                  <strong>Názov:</strong> {nazov_stavby}<br>
+                  <strong>Odoslanie:</strong> Zajtra
+                </p>
+              </div>
+
+              <p style="color:#9ca3af; font-size:12px; margin-top:24px;">
+                Toto je automatický testovací email pre kontrolu pred odoslaním.
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+        """
+
     def buildNotifiactionBody(self, znacka: str, nazov_stavby: str, link: str | None, days: int = 20) -> str:
         safe_title = f"{znacka} – {nazov_stavby}"
 
-        # časť s tlačidlom + linkom
         button_html = ""
         if link:
             button_html = f"""
@@ -96,6 +211,12 @@ class NotificationService:
                 <span>{link}</span>
             </div>
             """
+        else:
+            button_html = """
+            <p style="margin:0 0 16px; color:#dc2626; background:#fee2e2; padding:12px; border-radius:8px;">
+                ⚠️ Dokument sa nepodarilo nájsť na SharePointe. Kontaktuj administrátora.
+            </p>
+            """
 
         return f"""
         <!DOCTYPE html>
@@ -111,7 +232,7 @@ class NotificationService:
               <h1 style="font-size:20px; font-weight:700; margin:0 0 16px;">{safe_title}</h1>
 
               <div style="background:#f3f4f6; border-radius:8px; padding:12px 14px; font-size:14px; margin:12px 0 20px;">
-                Od odoslania vyjadrení prešlo <strong>{days} dní</strong>.
+                Od odoslania vyjadrenia prešlo <strong>{days} dní</strong>.
               </div>
 
               {button_html}
@@ -141,21 +262,70 @@ class NotificationService:
         unfinished = self.selectUnfinished()
         for item in unfinished:
             id_ = item["idnotification"]
-            test = item.get("test", False)
-            #test interface
-            """if test:
-                self.emailSender.sendEmail(
-                    f"{item['znacka']} - {item['nazovstavby']}",
-                   self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=30))
-                continue"""
+            znacka = item["znacka"]
+            nazov_stavby = item["nazovstavby"]
 
             first_date = date.fromisoformat(item["firstnotification"])
             second_date = date.fromisoformat(item["secondnotification"])
 
-            if today == first_date:
+            # Testovanie deň pred notifikáciami
+            test_first_date = first_date - timedelta(days=1)
+            test_second_date = second_date - timedelta(days=1)
+
+            # TEST pred prvou notifikáciou
+            if today == test_first_date:
+                print(f"[TEST] Testujem pre {znacka} (prvá notifikácia zajtra)")
+                try:
+                    sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
+                    test_email_sent = self.emailSender.sendEmail(
+                        f"🧪 TEST: {znacka} - {nazov_stavby}",
+                        self.buildTestEmailBody(znacka, nazov_stavby, sharepoint_link, 20),
+                        to_email="dvorsky@elprokan.sk"
+                    )
+                    if test_email_sent:
+                        self.logAction(id_, "testFirstNotification", "SUCCESS")
+                    else:
+                        self.logAction(id_, "testFirstNotification", "ERROR", self.emailSender.error_message)
+                except Exception as e:
+                    error_msg = f"Chyba pri teste: {str(e)}"
+                    print(f"[TEST ERROR] {error_msg}")
+                    self.emailSender.sendEmail(
+                        f"❌ TEST ERROR: {znacka}",
+                        self.buildTestEmailBody(znacka, nazov_stavby, None, 20, error=error_msg),
+                        to_email="dvorsky@elprokan.sk"
+                    )
+                    self.logAction(id_, "testFirstNotification", "ERROR", error_msg)
+
+            # TEST pred druhou notifikáciou
+            elif today == test_second_date:
+                print(f"[TEST] Testujem pre {znacka} (druhá notifikácia zajtra)")
+                try:
+                    sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
+                    test_email_sent = self.emailSender.sendEmail(
+                        f"🧪 TEST: {znacka} - {nazov_stavby}",
+                        self.buildTestEmailBody(znacka, nazov_stavby, sharepoint_link, 40),
+                        to_email="dvorsky@elprokan.sk"
+                    )
+                    if test_email_sent:
+                        self.logAction(id_, "testSecondNotification", "SUCCESS")
+                    else:
+                        self.logAction(id_, "testSecondNotification", "ERROR", self.emailSender.error_message)
+                except Exception as e:
+                    error_msg = f"Chyba pri teste: {str(e)}"
+                    print(f"[TEST ERROR] {error_msg}")
+                    self.emailSender.sendEmail(
+                        f"❌ TEST ERROR: {znacka}",
+                        self.buildTestEmailBody(znacka, nazov_stavby, None, 40, error=error_msg),
+                        to_email="dvorsky@elprokan.sk"
+                    )
+                    self.logAction(id_, "testSecondNotification", "ERROR", error_msg)
+
+            # SKUTOČNÁ prvá notifikácia
+            elif today == first_date:
+                sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
                 firstNotificationCheck = self.emailSender.sendEmail(
-                    f"{item['znacka']} - {item['nazovstavby']}",
-                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=20)
+                    f"{znacka} - {nazov_stavby}",
+                    self.buildNotifiactionBody(znacka, nazov_stavby, sharepoint_link, days=20)
                 )
 
                 if firstNotificationCheck:
@@ -163,10 +333,12 @@ class NotificationService:
                 else:
                     self.logAction(id_, "firstNotification", "ERROR", self.emailSender.error_message)
 
+            # SKUTOČNÁ druhá notifikácia (jedine tu sa nastaví done=True)
             elif today == second_date:
+                sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
                 secondNotification = self.emailSender.sendEmail(
-                    f"{item['znacka']} - {item['nazovstavby']}",
-                    self.buildNotifiactionBody(item['znacka'], item['nazovstavby'], item['sharedDocumentLink'], days=40)
+                    f"{znacka} - {nazov_stavby}",
+                    self.buildNotifiactionBody(znacka, nazov_stavby, sharepoint_link, days=40)
                 )
 
                 if secondNotification:
@@ -180,7 +352,6 @@ class NotificationService:
                     self.logAction(id_, "secondNotification", "ERROR", self.emailSender.error_message)
 
 
-
-
-n = NotificationService()
-n.checkAndNotify()
+if __name__ == "__main__":
+    n = NotificationService()
+    n.checkAndNotify()
