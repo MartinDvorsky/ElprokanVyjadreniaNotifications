@@ -1,25 +1,23 @@
 from datetime import date, timedelta
 from supabase import create_client, Client
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import msal
+import requests
 from datetime import datetime, timezone
 from typing import Optional
-
-# Import SharePoint managera z existujúceho súboru
-from SharepointKartaStavbyFinder import SharePointManager
-
 
 #from dotenv import load_dotenv
 #load_dotenv()
 
+
+# Import SharePoint managera z existujúceho súboru
+from SharepointKartaStavbyFinder import SharePointManager
+
 url = os.environ["SUPABASE_URL"]
 key = os.environ["SUPABASE_API_KEY"]
 email = os.environ["EMAIL"]
-email_pass = os.environ["EMAIL_PASSWORD"]
 
-# SharePoint credentials
+# SharePoint credentials (použijeme aj pre email)
 TENANT_ID = os.environ['TENANT_ID']
 CLIENT_ID = os.environ['CLIENT_ID']
 CLIENT_SECRET = os.environ['CLIENT_SECRET']
@@ -30,37 +28,119 @@ today = date.today()
 now_iso = datetime.now(timezone.utc).isoformat()
 
 
-class EmailSender:
-    def __init__(self):
-        self.outlook_email = email
-        self.outlook_password = email_pass
-        self.smtp_server = "smtp.office365.com"
-        self.smtp_port = 587
+class GraphEmailSender:
+    """
+    Email sender používajúci Microsoft Graph API namiesto SMTP.
+    Funguje s 2FA a je bezpečnejší.
+    """
+
+    def __init__(self, tenant_id: str, client_id: str, client_secret: str, from_email: str):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.from_email = from_email
         self.error_message = ""
 
-    def sendEmail(self, subject, body, to_email="elprokan@elprokan.sk"):
+    def get_access_token(self) -> Optional[str]:
+        """Získa access token pre Graph API"""
         try:
-            msg = MIMEMultipart()
-            msg["From"] = self.outlook_email
-            msg["To"] = to_email
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body, "html"))
+            authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+            app = msal.ConfidentialClientApplication(
+                self.client_id,
+                authority=authority,
+                client_credential=self.client_secret,
+            )
 
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.outlook_email, self.outlook_password)
-                server.send_message(msg)
-            return True
+            result = app.acquire_token_for_client(
+                scopes=["https://graph.microsoft.com/.default"]
+            )
+
+            if "access_token" in result:
+                return result["access_token"]
+            else:
+                error = result.get("error_description", result.get("error"))
+                self.error_message = f"Token error: {error}"
+                print(f"[AUTH ERROR] {self.error_message}")
+                return None
+
         except Exception as e:
-            print(f"[MAIL ERROR] {e}")
-            self.error_message = f"[SMTP MAIL ERROR] {e}"
+            self.error_message = f"Auth exception: {str(e)}"
+            print(f"[AUTH ERROR] {self.error_message}")
+            return None
+
+    def sendEmail(self, subject: str, body: str, to_email: str = "dvorsky@elprokan.sk") -> bool:
+        """
+        Pošle email cez Microsoft Graph API
+
+        Args:
+            subject: Predmet emailu
+            body: HTML obsah emailu
+            to_email: Príjemca
+
+        Returns:
+            bool: True ak sa podarilo odoslať
+        """
+        try:
+            token = self.get_access_token()
+            if not token:
+                return False
+
+            # Priprav správu
+            message = {
+                "message": {
+                    "subject": subject,
+                    "body": {
+                        "contentType": "HTML",
+                        "content": body
+                    },
+                    "toRecipients": [
+                        {
+                            "emailAddress": {
+                                "address": to_email
+                            }
+                        }
+                    ]
+                },
+                "saveToSentItems": "true"
+            }
+
+            # Pošli cez Graph API
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(
+                f"https://graph.microsoft.com/v1.0/users/{self.from_email}/sendMail",
+                headers=headers,
+                json=message,
+                timeout=30
+            )
+
+            if response.status_code == 202:
+                print(f"[MAIL] ✓ Email odoslaný na {to_email}")
+                return True
+            else:
+                self.error_message = f"Graph API error {response.status_code}: {response.text}"
+                print(f"[MAIL ERROR] {self.error_message}")
+                return False
+
+        except requests.exceptions.RequestException as e:
+            self.error_message = f"Request error: {str(e)}"
+            print(f"[MAIL ERROR] {self.error_message}")
+            return False
+        except Exception as e:
+            self.error_message = f"Unexpected error: {str(e)}"
+            print(f"[MAIL ERROR] {self.error_message}")
             return False
 
 
 class NotificationService:
     def __init__(self):
         self.supabase: Client = create_client(url, key)
-        self.emailSender = EmailSender()
+
+        # Použije Graph API namiesto SMTP
+        self.emailSender = GraphEmailSender(TENANT_ID, CLIENT_ID, CLIENT_SECRET, email)
 
         # Inicializácia SharePoint managera
         self.sharepoint = SharePointManager(TENANT_ID, CLIENT_ID, CLIENT_SECRET, OPENAI_API_KEY)
@@ -128,7 +208,7 @@ class NotificationService:
     def buildTestEmailBody(self, znacka: str, nazov_stavby: str, link: str | None,
                            days: int, error: str | None = None) -> str:
         """Email pre testovanie deň pred odoslaním"""
-        safe_title = f"🧪 TEST: {znacka} – {nazov_stavby}"
+        safe_title = f"🧪 TEST: {znacka} — {nazov_stavby}"
 
         if error:
             status_html = f"""
@@ -188,7 +268,7 @@ class NotificationService:
         """
 
     def buildNotifiactionBody(self, znacka: str, nazov_stavby: str, link: str | None, days: int = 20) -> str:
-        safe_title = f"{znacka} – {nazov_stavby}"
+        safe_title = f"{znacka} — {nazov_stavby}"
 
         button_html = ""
         if link:
@@ -214,7 +294,7 @@ class NotificationService:
         else:
             button_html = """
             <p style="margin:0 0 16px; color:#dc2626; background:#fee2e2; padding:12px; border-radius:8px;">
-                ⚠️ Dokument sa nepodarilo nájsť na SharePointe. Kontaktuj administrátora.
+                Dokument sa nepodarilo nájsť na SharePointe.
             </p>
             """
 
@@ -282,10 +362,7 @@ class NotificationService:
                         self.buildTestEmailBody(znacka, nazov_stavby, sharepoint_link, 20),
                         to_email="dvorsky@elprokan.sk"
                     )
-                    if test_email_sent:
-                        self.logAction(id_, "testFirstNotification", "SUCCESS")
-                    else:
-                        self.logAction(id_, "testFirstNotification", "ERROR", self.emailSender.error_message)
+
                 except Exception as e:
                     error_msg = f"Chyba pri teste: {str(e)}"
                     print(f"[TEST ERROR] {error_msg}")
@@ -306,10 +383,6 @@ class NotificationService:
                         self.buildTestEmailBody(znacka, nazov_stavby, sharepoint_link, 40),
                         to_email="dvorsky@elprokan.sk"
                     )
-                    if test_email_sent:
-                        self.logAction(id_, "testSecondNotification", "SUCCESS")
-                    else:
-                        self.logAction(id_, "testSecondNotification", "ERROR", self.emailSender.error_message)
                 except Exception as e:
                     error_msg = f"Chyba pri teste: {str(e)}"
                     print(f"[TEST ERROR] {error_msg}")
