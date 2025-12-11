@@ -68,7 +68,7 @@ class GraphEmailSender:
             print(f"[AUTH ERROR] {self.error_message}")
             return None
 
-    def sendEmail(self, subject: str, body: str, to_email: str = "dvorsky@elprokan.sk") -> bool:
+    def sendEmail(self, subject: str, body: str, to_email: str = "elprokan@elprokan.sk") -> bool:
         """
         Pošle email cez Microsoft Graph API
 
