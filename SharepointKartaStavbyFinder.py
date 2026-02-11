@@ -205,27 +205,36 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
             print("⚠ OpenAI API kľúč nie je nastavený, vraciam prvý súbor")
             return xlsx_files[0]
 
-        files_list = "\n".join([f"{i + 1}. {f['name']}" for i, f in enumerate(xlsx_files)])
+        # OPRAVA: Použij cestu namiesto len názvu súboru
+        files_list = "\n".join([
+            f"{i + 1}. {f.get('path', f['name'])}"
+            for i, f in enumerate(xlsx_files)
+        ])
 
         # Odstrániť rok zo značky pre lepšie porovnanie
         znacka_clean = znacka.split('/')[0]
 
-        prompt = f"""Máš zoznam Excel súborov (.xlsx) zo SharePointa a potrebuješ vybrať správny súbor "Karta stavby".
+        prompt = f"""Máš zoznam Excel súborov (.xlsx) zo SharePointa a potrebuješ vybrať správny súbor "Karta stavby" alebo hlavný súbor pre správu stavby.
 
-Značka stavby: {znacka_clean}
-Názov stavby: {nazov_stavby}
+    Značka stavby: {znacka_clean}
+    Názov stavby: {nazov_stavby}
 
-Nájdené súbory:
-{files_list}
+    Nájdené súbory (s cestou):
+    {files_list}
 
-Úloha: Vyber súbor, ktorý je "Karta stavby" pre danú značku a názov. Obvykle obsahuje text "karta stavby" alebo podobný názov v kombinácii so značkou.
+    Úloha: Vyber súbor, ktorý je hlavným súborom pre správu tejto stavby.
 
-PRIORITA:
-1. Súbor s názvom obsahujúcim "karta stavby" + značka stavby
-2. Súbor s názvom obsahujúcim "karta stavby"
-3. Akýkoľvek relevantný súbor pre danú stavbu
+    PRIORITA (od najvyššej po najnižšiu):
+    1. Súbor s názvom obsahujúcim "karta stavby" + značka stavby
+    2. Súbor s názvom obsahujúcim "karta stavby"
+    3. Súbor s názvom obsahujúcim "tabulka" + značka stavby v akejkoľvek ceste
+    4. Akýkoľvek súbor v adresári "ZIADOSTI" so značkou stavby
 
-Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek iného textu alebo vysvetlenia."""
+    VYLÚČ:
+    - Súbory s názvom obsahujúcim "ORS tabulka", "navratky", "vypis materialu", "bodove supisy", "ZOM", "Technicke_udaje", "kalkulacka", "Merne", "Poplatky"
+    - Súbory v adresároch: "Oznamenia", "F - Bodove supisy", "PL", "Prepočet"
+
+    Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek iného textu alebo vysvetlenia."""
 
         try:
             response = requests.post(
@@ -242,7 +251,7 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek in
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0,
-                    "max_tokens": 10
+                    "max_tokens": 1000
                 }
             )
 
@@ -253,7 +262,8 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek in
 
                 if 1 <= choice_num <= len(xlsx_files):
                     selected = xlsx_files[choice_num - 1]
-                    print(f"🤖 AI vybralo súbor: {selected['name']}")
+                    selected_path = selected.get('path', selected['name'])
+                    print(f"🤖 AI vybralo súbor: {selected_path}")
                     return selected
                 else:
                     print(f"⚠ AI vrátilo neplatné číslo ({choice_num}), vraciam prvý súbor")
@@ -303,22 +313,34 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek in
                 print(f"✗ Priečinok obsahujúci '{znacka_clean}' sa nenašiel")
                 return None
 
-            # Odstránenie duplicít podľa názvu (case-insensitive)
+            # Odstránenie duplicít podľa názvu (case-insensitive) - ale ulož si všetky ID
             seen_names = {}
             unique_folders = []
+            all_folder_ids = []  # Všetky priečinky s rovnakým názvom
+
             for folder in folders:
                 folder_name_lower = folder['name'].lower()
                 if folder_name_lower not in seen_names:
-                    seen_names[folder_name_lower] = True
+                    seen_names[folder_name_lower] = []
                     unique_folders.append(folder)
-                else:
-                    print(f"  ⚠ Preskakujem duplicitný priečinok: {folder['name']} (ID: {folder['id']})")
+                seen_names[folder_name_lower].append(folder)
+
+            # Pre každý unikátny názov ulož všetky jeho varianty
+            for folder in unique_folders:
+                folder_name_lower = folder['name'].lower()
+                all_variants = seen_names[folder_name_lower]
+                if len(all_variants) > 1:
+                    print(f"  ℹ️ Našiel som {len(all_variants)} variantov priečinka '{folder['name']}'")
+                    for variant in all_variants[1:]:
+                        print(f"    - Duplicitný variant (ID: {variant['id']})")
 
             folders = unique_folders
 
             if len(folders) == 1:
                 folder = folders[0]
                 print(f"✓ Našiel som 1 priečinok: {folder['name']}")
+                # Pridaj všetky varianty ako kandidátov
+                folder['_all_candidates'] = seen_names[folder['name'].lower()]
             else:
                 print(f"✓ Našiel som {len(folders)} unikátnych priečinkov")
 
@@ -339,6 +361,7 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek in
 
                     folder['xlsx_files'] = xlsx_files
                     folder['xlsx_count'] = len(xlsx_files)
+                    folder['_all_candidates'] = seen_names[folder['name'].lower()]
                     folders_with_files.append(folder)
 
                     print(f"  {len(folders_with_files)}. {folder['name']}")
@@ -376,29 +399,61 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(xlsx_files)}) bez akéhokoľvek in
         if not folder:
             return []
 
-        folder_id = folder["id"]
+        # Ulož si všetky nájdené priečinky (nie len vybraný)
+        all_folders = folder.get('_all_candidates', [folder])
 
-        print(f"Získavam súbory z priečinka{' (vrátane podpriečinkov)' if search_subfolders else ''}...")
+        def get_files_recursive(folder_id: str, path: str = "") -> List[Dict]:
+            """Rekurzívne získa všetky xlsx súbory z priečinka a podpriečinkov"""
+            endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/items/{folder_id}/children"
+            response = requests.get(endpoint, headers=self._get_headers())
 
-        endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/items/{folder_id}/children"
-        response = requests.get(endpoint, headers=self._get_headers())
+            xlsx_files = []
 
-        if response.status_code == 200:
-            all_items = response.json().get("value", [])
-            xlsx_files = [
-                item for item in all_items
-                if "file" in item and item["name"].lower().endswith(".xlsx")
-            ]
-        else:
-            print(f"✗ Chyba pri získavaní súborov: {response.status_code}")
-            return []
+            if response.status_code == 200:
+                items = response.json().get("value", [])
 
-        print(f"✓ Našiel som {len(xlsx_files)} .xlsx súbor(ov)")
+                for item in items:
+                    current_path = f"{path}/{item['name']}" if path else item['name']
+
+                    # Ak je to xlsx súbor, pridaj ho
+                    if "file" in item and item["name"].lower().endswith(".xlsx"):
+                        item['path'] = current_path
+                        xlsx_files.append(item)
+
+                    # Ak je to priečinok a chceme prehľadávať podpriečinky, rekurzívne prehľadaj
+                    elif "folder" in item and search_subfolders:
+                        print(f"  📁 Prehľadávam podpriečinok: {current_path}")
+                        xlsx_files.extend(get_files_recursive(item['id'], current_path))
+            else:
+                print(f"✗ Chyba pri získavaní súborov z {path or 'root'}: {response.status_code}")
+
+            return xlsx_files
+
+        # Skús všetky nájdené priečinky, až kým nenájdeš xlsx súbory
+        xlsx_files = []
+        for idx, folder_candidate in enumerate(all_folders):
+            folder_id = folder_candidate["id"]
+            folder_name = folder_candidate["name"]
+
+            if idx == 0:
+                print(f"Získavam súbory z priečinka{' (vrátane podpriečinkov)' if search_subfolders else ''}...")
+            else:
+                print(
+                    f"\n⚠ V prvom priečinku sa nenašli xlsx súbory, skúšam ďalší kandidát ({idx + 1}/{len(all_folders)})...")
+                print(f"  Priečinok: {folder_name}")
+
+            xlsx_files = get_files_recursive(folder_id)
+
+            if xlsx_files:
+                print(f"✓ Našiel som {len(xlsx_files)} .xlsx súbor(ov) v: {folder_name}")
+                break  # Našli sme súbory, netreba ďalej hľadať
+            else:
+                print(f"✓ Našiel som 0 .xlsx súbor(ov) v: {folder_name}")
 
         if xlsx_files:
             for i, file in enumerate(xlsx_files, 1):
                 size_mb = file.get("size", 0) / (1024 * 1024)
-                path = file.get('name')
+                path = file.get('path', file.get('name'))
                 print(f"  {i}. {path} ({size_mb:.2f} MB)")
 
             # Ak je viac súborov a auto_select je zapnutý, vyber správny pomocou AI
@@ -438,7 +493,11 @@ if __name__ == "__main__":
         ["EP25054/2025", "Drienov, ul. Šífnava, II. Etapa – TS, NN"]
     ]
 
-    for znacka in znacky_stavby:
+    znacky_stavby2 = [
+        ["IP12360/2024", "Čerhov - úprava NN a DP z TS4"]
+    ]
+
+    for znacka in znacky_stavby2:
         print(f"\n\n{'=' * 70}")
         print(f"=== Hľadám pre značku: {znacka[0]} | {znacka[1]} ===")
         print(f"{'=' * 70}")
@@ -447,7 +506,7 @@ if __name__ == "__main__":
         files = shp.get_xlsx_files_from_folder(
             znacka[0],
             znacka[1],
-            search_subfolders=False,
+            search_subfolders=True,
             auto_select=True
         )
 
