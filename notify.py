@@ -169,9 +169,15 @@ class NotificationService:
         }
         self.supabase.table("notification_logs").insert(payload).execute()
 
-    def getSharePointLink(self, znacka: str, nazov_stavby: str) -> Optional[str]:
+    def saveSharePointLink(self, notification_id: int, link: Optional[str]):
+        try:
+            self.supabase.table("notification").update({"sharedDocumentLink": link}).eq("idnotification", notification_id).execute()
+        except Exception as e:
+            print(f"[saveSharePointLink ERROR] {e}")
+
+    def getSharePointLink(self, notification_id: int, znacka: str, nazov_stavby: str) -> Optional[str]:
         """
-        Nájde Kartu stavby na SharePointe a vráti webUrl
+        Nájde Kartu stavby na SharePointe, uloží jej webUrl do DB a vráti ju
 
         Returns:
             str: SharePoint webUrl alebo None ak sa nenašiel
@@ -179,20 +185,14 @@ class NotificationService:
         try:
             print(f"[SharePoint] Hľadám súbor pre {znacka}...")
 
-            # Použije existujúcu metódu na vyhľadanie xlsx súborov
-            files = self.sharepoint.get_xlsx_files_from_folder(
-                znacka,
-                nazov_stavby,
-                search_subfolders=False,
-                auto_select=True
-            )
+            selected_file = self.sharepoint.find_karta_stavby(znacka, nazov_stavby)
 
-            if files and len(files) > 0:
-                selected_file = files[0]
+            if selected_file:
                 web_url = selected_file.get('webUrl')
 
                 if web_url:
-                    print(f"[SharePoint] ✓ Nájdený: {selected_file['name']}")
+                    print(f"[SharePoint] ✓ Nájdený: {selected_file.get('path', selected_file['name'])}")
+                    self.saveSharePointLink(notification_id, web_url)
                     return web_url
                 else:
                     print(f"[SharePoint] ✗ webUrl nebola nájdená v odpovedi")
@@ -356,7 +356,7 @@ class NotificationService:
             if today == test_first_date:
                 print(f"[TEST] Testujem pre {znacka} (prvá notifikácia zajtra)")
                 try:
-                    sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
+                    sharepoint_link = self.getSharePointLink(id_, znacka, nazov_stavby)
                     test_email_sent = self.emailSender.sendEmail(
                         f"🧪 TEST: {znacka} - {nazov_stavby}",
                         self.buildTestEmailBody(znacka, nazov_stavby, sharepoint_link, 20),
@@ -377,7 +377,7 @@ class NotificationService:
             elif today == test_second_date:
                 print(f"[TEST] Testujem pre {znacka} (druhá notifikácia zajtra)")
                 try:
-                    sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
+                    sharepoint_link = self.getSharePointLink(id_, znacka, nazov_stavby)
                     test_email_sent = self.emailSender.sendEmail(
                         f"🧪 TEST: {znacka} - {nazov_stavby}",
                         self.buildTestEmailBody(znacka, nazov_stavby, sharepoint_link, 40),
@@ -395,7 +395,7 @@ class NotificationService:
 
             # SKUTOČNÁ prvá notifikácia
             elif today == first_date:
-                sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
+                sharepoint_link = self.getSharePointLink(id_, znacka, nazov_stavby)
                 firstNotificationCheck = self.emailSender.sendEmail(
                     f"{znacka} - {nazov_stavby}",
                     self.buildNotifiactionBody(znacka, nazov_stavby, sharepoint_link, days=20)
@@ -408,7 +408,7 @@ class NotificationService:
 
             # SKUTOČNÁ druhá notifikácia (jedine tu sa nastaví done=True)
             elif today == second_date:
-                sharepoint_link = self.getSharePointLink(znacka, nazov_stavby)
+                sharepoint_link = self.getSharePointLink(id_, znacka, nazov_stavby)
                 secondNotification = self.emailSender.sendEmail(
                     f"{znacka} - {nazov_stavby}",
                     self.buildNotifiactionBody(znacka, nazov_stavby, sharepoint_link, days=40)

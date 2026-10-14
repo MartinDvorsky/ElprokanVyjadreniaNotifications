@@ -1,8 +1,11 @@
 import msal
 import requests
 import os
+import re
+import unicodedata
 
 from typing import Optional, List, Dict
+from urllib.parse import unquote
 
 #from dotenv import load_dotenv
 #load_dotenv()
@@ -13,6 +16,26 @@ CLIENT_ID = os.environ['CLIENT_ID']
 CLIENT_SECRET = os.environ['CLIENT_SECRET']
 SHAREPOINT_SITE_URL = os.environ['SHAREPOINT_SITE_URL']
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+
+# Priečinky projektov zo SPIDERu majú rovnaký názov ako stavba, ale kartu stavby neobsahujú
+EXCLUDED_FOLDERS = ("spider",)
+# Vzorové karty stavby (napr. "karta stavby - VZOR.xlsx")
+EXCLUDED_FILE_NAMES = ("vzor",)
+
+
+def _normalize(text: str) -> str:
+    """Malé písmená bez diakritiky a bez medzier/podčiarkovníkov/pomlčiek ("Karta_stavby - X" -> "kartastavbyx")"""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _is_excluded_file(name: str) -> bool:
+    return any(excluded in _normalize(name) for excluded in EXCLUDED_FILE_NAMES)
+
+
+def _is_excluded_path(path: str) -> bool:
+    parts = [p.lower() for p in unquote(path).split("/")]
+    return any(excluded in parts for excluded in EXCLUDED_FOLDERS)
 
 
 class SharePointManager:
@@ -276,6 +299,105 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
             print(f"⚠ Chyba pri volaní AI: {e}, vraciam prvý súbor")
             return xlsx_files[0]
 
+    def _search_all(self, query: str, max_pages: int = 20) -> Optional[List[Dict]]:
+        """
+        Vyhľadá položky na SharePointe a prejde všetky stránky výsledkov (@odata.nextLink)
+
+        Returns:
+            List[Dict]: Všetky nájdené položky alebo None pri chybe
+        """
+        endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/root/search(q='{query}')"
+        results = []
+
+        for _ in range(max_pages):
+            response = requests.get(endpoint, headers=self._get_headers())
+            if response.status_code != 200:
+                print(f"✗ Chyba pri vyhľadávaní: {response.status_code}")
+                print(response.text)
+                return results or None
+
+            data = response.json()
+            results.extend(data.get("value", []))
+            endpoint = data.get("@odata.nextLink")
+            if not endpoint:
+                break
+
+        return results
+
+    def _get_item_path(self, item_id: str) -> str:
+        """Vráti cestu položky v knižnici (napr. "projekty/2026/.../ZIADOSTI/DRS")"""
+        endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/items/{item_id}"
+        response = requests.get(endpoint, headers=self._get_headers())
+        if response.status_code != 200:
+            return ""
+        path = response.json().get("parentReference", {}).get("path", "")
+        return path.split("root:", 1)[-1].lstrip("/")
+
+    def find_karta_by_search(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
+        """
+        Nájde kartu stavby priamo vo výsledkoch vyhľadávania, bez ohľadu na to,
+        ako hlboko je uložená v priečinku stavby
+
+        Args:
+            znacka: Značka stavby (napr. "IP13024/2026")
+            nazov_stavby: Názov stavby
+
+        Returns:
+            Dict: Súbor karty stavby (s 'path') alebo None
+        """
+        if not self.site_id:
+            print("✗ Najprv musíš získať Site ID")
+            return None
+
+        znacka_clean = znacka.split('/')[0]
+        print(f"\nHľadám súbor karty stavby pre '{znacka_clean}'...")
+
+        results = self._search_all(znacka_clean)
+        if not results:
+            return None
+
+        candidates = []
+        for item in results:
+            name = item["name"]
+            name_normalized = _normalize(name)
+            if ("file" in item and name.lower().endswith(".xlsx")
+                    and "kartastavby" in name_normalized
+                    and _normalize(znacka_clean) in name_normalized
+                    and not _is_excluded_file(name)):
+                folder_path = self._get_item_path(item["id"])
+                if _is_excluded_path(folder_path):
+                    continue
+                item['path'] = f"{folder_path}/{name}" if folder_path else name
+                candidates.append(item)
+
+        if not candidates:
+            print(f"✗ Súbor karty stavby pre '{znacka_clean}' sa nenašiel")
+            return None
+
+        # Pri viacerých kartách vyhrá naposledy upravená - tá, s ktorou sa reálne pracuje
+        candidates.sort(key=lambda f: f.get("lastModifiedDateTime", ""), reverse=True)
+        for c in candidates:
+            print(f"  - {c['path']} (upravené {c.get('lastModifiedDateTime', '?')})")
+
+        print(f"✓ Našiel som kartu stavby: {candidates[0]['path']}")
+        return candidates[0]
+
+    def find_karta_stavby(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
+        """
+        Nájde kartu stavby: najprv priamo podľa názvu súboru, potom cez priečinok stavby
+        (vrátane podpriečinkov)
+
+        Returns:
+            Dict: Vybraný súbor alebo None
+        """
+        karta = self.find_karta_by_search(znacka, nazov_stavby)
+        if karta:
+            return karta
+
+        print("\nKarta stavby so značkou v názve sa nenašla, hľadám cez priečinok stavby...")
+        files = self.get_xlsx_files_from_folder(znacka, nazov_stavby, search_subfolders=True, auto_select=True)
+        return files[0] if files else None
+
     def find_folder_by_name(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
         """
         Nájde priečinok, ktorý obsahuje zadanú značku v názve
@@ -298,15 +420,13 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
         rok = znacka_parts[1] if len(znacka_parts) > 1 else None  # Napr. "2025"
 
         print(f"\nHľadám priečinok obsahujúci '{znacka_clean}'" + (f" (rok: {rok})" if rok else "") + "...")
-        endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/root/search(q='{znacka_clean}')"
-        response = requests.get(endpoint, headers=self._get_headers())
+        results = self._search_all(znacka_clean)
 
-        if response.status_code == 200:
-            results = response.json().get("value", [])
-
+        if results is not None:
             folders = [
                 item for item in results
                 if "folder" in item and znacka_clean.lower() in item["name"].lower()
+                and not _is_excluded_path(item.get("webUrl", ""))
             ]
 
             if not folders:
@@ -357,6 +477,7 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
                         xlsx_files = [
                             item['name'] for item in items
                             if "file" in item and item["name"].lower().endswith(".xlsx")
+                            and not _is_excluded_file(item["name"])
                         ]
 
                     folder['xlsx_files'] = xlsx_files
@@ -376,8 +497,6 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
             print(f"  ID: {folder['id']}")
             return folder
         else:
-            print(f"✗ Chyba pri vyhľadávaní: {response.status_code}")
-            print(response.text)
             return None
 
     def get_xlsx_files_from_folder(self, znacka: str, nazov_stavby: str = "",
@@ -417,11 +536,13 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
 
                     # Ak je to xlsx súbor, pridaj ho
                     if "file" in item and item["name"].lower().endswith(".xlsx"):
+                        if _is_excluded_file(item["name"]):
+                            continue
                         item['path'] = current_path
                         xlsx_files.append(item)
 
                     # Ak je to priečinok a chceme prehľadávať podpriečinky, rekurzívne prehľadaj
-                    elif "folder" in item and search_subfolders:
+                    elif "folder" in item and search_subfolders and not _is_excluded_path(current_path):
                         print(f"  📁 Prehľadávam podpriečinok: {current_path}")
                         xlsx_files.extend(get_files_recursive(item['id'], current_path))
             else:
