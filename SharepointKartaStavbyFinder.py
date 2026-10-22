@@ -2,6 +2,9 @@ import msal
 import requests
 import os
 import re
+import io
+import html
+import zipfile
 import unicodedata
 
 from typing import Optional, List, Dict
@@ -19,18 +22,12 @@ OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 
 # Priečinky projektov zo SPIDERu majú rovnaký názov ako stavba, ale kartu stavby neobsahujú
 EXCLUDED_FOLDERS = ("spider",)
-# Vzorové karty stavby (napr. "karta stavby - VZOR.xlsx")
-EXCLUDED_FILE_NAMES = ("vzor",)
 
 
 def _normalize(text: str) -> str:
     """Malé písmená bez diakritiky a bez medzier/podčiarkovníkov/pomlčiek ("Karta_stavby - X" -> "kartastavbyx")"""
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]", "", text.lower())
-
-
-def _is_excluded_file(name: str) -> bool:
-    return any(excluded in _normalize(name) for excluded in EXCLUDED_FILE_NAMES)
 
 
 def _is_excluded_path(path: str) -> bool:
@@ -333,10 +330,54 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
         path = response.json().get("parentReference", {}).get("path", "")
         return path.split("root:", 1)[-1].lstrip("/")
 
-    def find_karta_by_search(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
+    def _is_karta_stavby_workbook(self, item: Dict) -> bool:
         """
-        Nájde kartu stavby priamo vo výsledkoch vyhľadávania, bez ohľadu na to,
-        ako hlboko je uložená v priečinku stavby
+        Skutočná karta stavby má hárok "PROJEKT". Tabuľka generovaná programom na vyjadrenia
+        (napr. "karta_stavby_IP13181.xlsx") má iba jeden hárok "VYJADRENIA ..."
+        """
+        endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/items/{item['id']}/content"
+        response = requests.get(endpoint, headers=self._get_headers())
+        if response.status_code != 200:
+            print(f"  ⚠ Nepodarilo sa stiahnuť {item['name']}: {response.status_code}")
+            return False
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as xlsx:
+                workbook = xlsx.read("xl/workbook.xml").decode("utf-8")
+        except (zipfile.BadZipFile, KeyError) as e:
+            print(f"  ⚠ Nepodarilo sa prečítať {item['name']}: {e}")
+            return False
+
+        sheets = [html.unescape(name).strip().upper() for name in re.findall(r'<sheet [^>]*name="([^"]+)"', workbook)]
+        return "PROJEKT" in sheets
+
+    def _list_xlsx(self, folder_id: str, path: str, recursive: bool) -> List[Dict]:
+        """Vráti xlsx súbory v priečinku, pri recursive=True aj v podpriečinkoch (okrem priečinkov SPIDER)"""
+        endpoint = f"{self.base_graph_url}/sites/{self.site_id}/drive/items/{folder_id}/children"
+        files = []
+
+        while endpoint:
+            response = requests.get(endpoint, headers=self._get_headers())
+            if response.status_code != 200:
+                print(f"✗ Chyba pri získavaní súborov z {path}: {response.status_code}")
+                break
+
+            data = response.json()
+            for item in data.get("value", []):
+                current_path = f"{path}/{item['name']}"
+                if "file" in item and item["name"].lower().endswith(".xlsx"):
+                    item['path'] = current_path
+                    files.append(item)
+                elif "folder" in item and recursive and not _is_excluded_path(current_path):
+                    files.extend(self._list_xlsx(item['id'], current_path, recursive))
+            endpoint = data.get("@odata.nextLink")
+
+        return files
+
+    def find_karta_stavby(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
+        """
+        Nájde kartu stavby vo výsledkoch vyhľadávania alebo v priečinku stavby (najprv v koreni, potom v podpriečinkoch).
+        Kartou je iba súbor s hárkom "PROJEKT" - aj nepremenovaná "karta stavby - VZOR V2.xlsx".
 
         Args:
             znacka: Značka stavby (napr. "IP13024/2026")
@@ -350,53 +391,61 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
             return None
 
         znacka_clean = znacka.split('/')[0]
-        print(f"\nHľadám súbor karty stavby pre '{znacka_clean}'...")
+        znacka_normalized = _normalize(znacka_clean)
+        print(f"\nHľadám kartu stavby pre '{znacka_clean}'...")
 
         results = self._search_all(znacka_clean)
         if not results:
+            print(f"✗ Pre '{znacka_clean}' sa nič nenašlo")
             return None
 
-        candidates = []
+        # Súbory karty stavby so značkou v názve priamo z výsledkov vyhľadávania
+        candidates: Dict[str, Dict] = {}
         for item in results:
-            name = item["name"]
-            name_normalized = _normalize(name)
-            if ("file" in item and name.lower().endswith(".xlsx")
-                    and "kartastavby" in name_normalized
-                    and _normalize(znacka_clean) in name_normalized
-                    and not _is_excluded_file(name)):
+            name_normalized = _normalize(item["name"])
+            if ("file" in item and item["name"].lower().endswith(".xlsx")
+                    and "kartastavby" in name_normalized and znacka_normalized in name_normalized):
                 folder_path = self._get_item_path(item["id"])
-                if _is_excluded_path(folder_path):
-                    continue
-                item['path'] = f"{folder_path}/{name}" if folder_path else name
-                candidates.append(item)
+                if not _is_excluded_path(folder_path):
+                    item['path'] = f"{folder_path}/{item['name']}"
+                    candidates[item["id"]] = item
 
-        if not candidates:
-            print(f"✗ Súbor karty stavby pre '{znacka_clean}' sa nenašiel")
+        stavba_folders = [
+            folder for folder in results
+            if "folder" in folder and znacka_normalized in _normalize(folder["name"])
+            and not _is_excluded_path(folder.get("webUrl", ""))
+        ]
+
+        # Karta býva v koreni priečinka stavby - podpriečinky sa prehľadávajú, až keď tam nie je
+        checked = set()
+        karty = []
+        for recursive in (False, True):
+            for folder in stavba_folders:
+                for item in self._list_xlsx(folder["id"], folder["name"], recursive):
+                    if "kartastavby" in _normalize(item["name"]):
+                        candidates.setdefault(item["id"], item)
+
+            for item in candidates.values():
+                if item["id"] in checked:
+                    continue
+                checked.add(item["id"])
+                is_karta = self._is_karta_stavby_workbook(item)
+                print(f"  {'✓' if is_karta else '✗'} {item['path']} (upravené {item.get('lastModifiedDateTime', '?')})")
+                if is_karta:
+                    karty.append(item)
+
+            if karty:
+                break
+
+        if not karty:
+            print(f"✗ Karta stavby pre '{znacka_clean}' sa nenašla")
             return None
 
-        # Pri viacerých kartách vyhrá naposledy upravená - tá, s ktorou sa reálne pracuje
-        candidates.sort(key=lambda f: f.get("lastModifiedDateTime", ""), reverse=True)
-        for c in candidates:
-            print(f"  - {c['path']} (upravené {c.get('lastModifiedDateTime', '?')})")
-
-        print(f"✓ Našiel som kartu stavby: {candidates[0]['path']}")
-        return candidates[0]
-
-    def find_karta_stavby(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
-        """
-        Nájde kartu stavby: najprv priamo podľa názvu súboru, potom cez priečinok stavby
-        (vrátane podpriečinkov)
-
-        Returns:
-            Dict: Vybraný súbor alebo None
-        """
-        karta = self.find_karta_by_search(znacka, nazov_stavby)
-        if karta:
-            return karta
-
-        print("\nKarta stavby so značkou v názve sa nenašla, hľadám cez priečinok stavby...")
-        files = self.get_xlsx_files_from_folder(znacka, nazov_stavby, search_subfolders=True, auto_select=True)
-        return files[0] if files else None
+        # Prednosť má karta so značkou v názve, potom naposledy upravená
+        karty.sort(key=lambda f: (znacka_normalized in _normalize(f["name"]), f.get("lastModifiedDateTime", "")),
+                   reverse=True)
+        print(f"✓ Našiel som kartu stavby: {karty[0]['path']}")
+        return karty[0]
 
     def find_folder_by_name(self, znacka: str, nazov_stavby: str = "") -> Optional[Dict]:
         """
@@ -477,7 +526,6 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
                         xlsx_files = [
                             item['name'] for item in items
                             if "file" in item and item["name"].lower().endswith(".xlsx")
-                            and not _is_excluded_file(item["name"])
                         ]
 
                     folder['xlsx_files'] = xlsx_files
@@ -536,8 +584,6 @@ Odpoveď MUSÍ byť len jedno číslo (1-{len(folders)}) bez akéhokoľvek inéh
 
                     # Ak je to xlsx súbor, pridaj ho
                     if "file" in item and item["name"].lower().endswith(".xlsx"):
-                        if _is_excluded_file(item["name"]):
-                            continue
                         item['path'] = current_path
                         xlsx_files.append(item)
 
